@@ -2,16 +2,16 @@ import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 
-st.set_page_config(page_title="Kapacitné plánovanie & Simulátor", layout="wide")
+st.set_page_config(page_title="Kapacitné plánovanie & WIP Balanc", layout="wide")
 
-st.title("📦 Kapacitné plánovanie a Simulátor rozloženia práce")
+st.title("📦 Vyrovnávanie kapacít a Zostatok práce na sklade (WIP)")
 
 # --- BOČNÝ PANEL ---
 st.sidebar.header("⚙️ Nastavenia výkonu")
 pick_rate_default = st.sidebar.number_input("Norma (Joblines / hod na 1 človeka)", value=40, step=5)
 
 st.sidebar.markdown("---")
-st.sidebar.header("🎛️ Simulátor smien (Počet ľudí)")
+st.sidebar.header("🎛️ Plánovanie zmeny")
 simulated_workers = st.sidebar.slider("Konštantný počet ľudí na zmene", min_value=1, max_value=100, value=15)
 
 REQUIRED_COLUMNS = ['Vznik Line', 'Limit nanesení', 'Čas zvozu', 'JobLine', 'Geo Size produktu', 'RoutingType', 'Množstvo']
@@ -33,7 +33,6 @@ def load_and_process_data(file):
         except:
             df = pd.read_excel(file, engine='openpyxl', usecols=lambda c: c in REQUIRED_COLUMNS)
     
-    # Robustná konverzia časov
     df['Vznik_dt'] = pd.to_datetime(df['Vznik Line'], dayfirst=True, errors='coerce')
     df['Limit_dt'] = pd.to_datetime(df['Limit nanesení'], dayfirst=True, errors='coerce')
     return df
@@ -72,11 +71,6 @@ if uploaded_file is not None:
     if routings:
         filtered_df = filtered_df[filtered_df['RoutingType'].isin(selected_routing)]
 
-    # Kontrola, či sa Vznik Line podarilo správne nacítat
-    valid_vznik_count = filtered_df['Vznik_dt'].notnull().sum()
-    if valid_vznik_count == 0:
-        st.warning("⚠️ Upozornenie: Stĺpec 'Vznik Line' sa nepodariło preložiť na časový formát. Skontrolujte formát v Exceli.")
-
     def assign_effective_hour(row):
         vznik = row['Vznik_dt']
         if pd.isnull(vznik) or vznik < shift_start:
@@ -103,92 +97,121 @@ if uploaded_file is not None:
     hourly['Kumulativny_Limit'] = hourly['Limit_v_hodine'].cumsum()
     hourly['Hodina_Label'] = hourly['Hodina'].astype(str).str.zfill(2) + ":00"
 
-    # --- SIMULÁCIA ---
+    # --- SIMULÁCIA BALANCU A ZOSTATKU PRÁCE (WIP) ---
     hourly_capacity = simulated_workers * pick_rate_default
-    simulated_picked = []
-    current_total_picked = 0
+    
+    current_wip = 0
+    simulated_picked_hourly = []
+    wip_at_end_of_hour = []
+    cumulative_picked = []
+    total_picked_so_far = 0
 
     for idx, row in hourly.iterrows():
-        max_available = row['Kumulativne_Vzniknute']
-        current_total_picked = min(max_available, current_total_picked + hourly_capacity)
-        simulated_picked.append(current_total_picked)
+        new_inflow = row['Vzniknute_v_hodine']
+        total_available = current_wip + new_inflow
+        
+        # Vypickujeme toľko, koľko je kapacita ľudí, ale max. toľko, koľko je dostupné
+        actually_picked = min(total_available, hourly_capacity)
+        
+        # Zostatok práce na sklade po tejto hodine
+        current_wip = total_available - actually_picked
+        total_picked_so_far += actually_picked
+        
+        simulated_picked_hourly.append(actually_picked)
+        wip_at_end_of_hour.append(current_wip)
+        cumulative_picked.append(total_picked_so_far)
 
-    hourly['Simulovane_Vypickovane'] = simulated_picked
-    hourly['Meskanie'] = hourly['Simulovane_Vypickovane'] < hourly['Kumulativny_Limit']
+    hourly['Vypickovane_v_hodine'] = simulated_picked_hourly
+    hourly['Zostatok_Prace_WIP'] = wip_at_end_of_hour
+    hourly['Kumulativne_Vypickovane'] = cumulative_picked
+    
+    # Kontrola meškania voči limitom nanesenia
+    hourly['Meskanie'] = hourly['Kumulativne_Vypickovane'] < hourly['Kumulativny_Limit']
     has_delay = hourly['Meskanie'].any()
 
     # --- KPI METRIKY ---
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Celkom Joblines", f"{len(filtered_df):,}")
-    c2.metric("Nastavený počet ľudí", f"{simulated_workers} ľudí")
-    c3.metric("Kapacita tímu za hodinu", f"{hourly_capacity:,} lines/h")
+    c1.metric("Celkom Joblines na deň", f"{len(filtered_df):,}")
+    c2.metric("Kapacita tímu / hodina", f"{hourly_capacity:,} lines")
+    c3.metric("Zostatok na konci zmeny (o 05:00)", f"{int(hourly.iloc[-1]['Zostatok_Prace_WIP']):,} lines")
     
     if has_delay:
-        c4.metric("Stav simulácie", "⚠️ VZNIKNE MEŠKANIE!", delta_color="inverse")
+        c4.metric("Stav plnenia limitov", "⚠️ MEŠKANIE DÔLEŽITÝCH LIMITOV!", delta_color="inverse")
     else:
-        c4.metric("Stav simulácie", "✅ VŠETKO SA STÍHA", delta_color="normal")
+        c4.metric("Stav plnenia limitov", "✅ VŠETKY LIMITI SPLNENÉ", delta_color="normal")
 
     st.markdown("---")
 
-    # --- GRAF 1: HODINOVÝ PRÍTOK PRÁCE VS DEADLINE ---
-    st.subheader("📊 1. Hodinový vznik prác (Vznik v hodine vs. Limit v hodine)")
+    # --- GRAF 1: HODINOVÁ BILANCIA (PRÍTOK VS VYPICKOVANÉ VS ZOSTATOK) ---
+    st.subheader("📊 1. Hodinový tok: Vznik práce vs. Vypickované vs. Zostatok (WIP)")
     
-    fig_hourly = go.Figure()
-    fig_hourly.add_trace(go.Bar(
+    fig_flow = go.Figure()
+    # Nové vzniknuté
+    fig_flow.add_trace(go.Bar(
         x=hourly['Hodina_Label'], 
         y=hourly['Vzniknute_v_hodine'],
-        name='Nové Vzniknuté Joblines (v hodine)',
-        marker_color='#2ca02c'
+        name='1. Nové Vzniknuté joblines',
+        marker_color='#2ca02c',
+        opacity=0.7
     ))
-    fig_hourly.add_trace(go.Bar(
+    # Vypickované ľuďmi
+    fig_flow.add_trace(go.Bar(
         x=hourly['Hodina_Label'], 
-        y=hourly['Limit_v_hodine'],
-        name='Deadline - Limit nanesenia (v hodine)',
-        marker_color='#d62728'
+        y=hourly['Vypickovane_v_hodine'],
+        name=f'2. Vypickované ({simulated_workers} ľudí)',
+        marker_color='#9467bd'
     ))
-    fig_hourly.update_layout(
+    # Čiara zostatku (WIP)
+    fig_flow.add_trace(go.Scatter(
+        x=hourly['Hodina_Label'], 
+        y=hourly['Zostatok_Prace_WIP'],
+        name='3. ZOSTATOK PRÁCE NA SKLADE (WIP)',
+        mode='lines+markers',
+        line=dict(color='#ff7f0e', width=3)
+    ))
+    fig_flow.update_layout(
         barmode='group',
+        title="Priebeh spracovania práce a aktuálny zostatok čakania na pickovanie",
         xaxis_title="Prevádzková hodina (06:00 -> 05:00)",
         yaxis_title="Počet Joblines",
         xaxis=dict(type='category')
     )
-    st.plotly_chart(fig_hourly, use_container_width=True)
+    st.plotly_chart(fig_flow, use_container_width=True)
 
-    # --- GRAF 2: KUMULATÍVNY FLOW DIAGRAM (CFD) ---
-    st.subheader("📈 2. Kumulatívna zásoba vs. Simulácia pickovania")
+    # --- GRAF 2: KUMULATÍVNY SÚČET A KONTROLA LIMITOV ---
+    st.subheader("📈 2. Vyrovnaná kumulatívna krivka vs. Limity nanesenia")
 
     fig_cum = go.Figure()
 
-    # Červená čiara - Min čo musí byť vypickované
+    # Max Vzniknuté
     fig_cum.add_trace(go.Scatter(
         x=hourly['Hodina_Label'], 
-        y=hourly['Kumulativny_Limit'],
-        name='🔴 MINIMUM: Limit nanesenia (Deadline)',
-        mode='lines+markers',
-        line=dict(color='#d62728', width=3, dash='dash')
+        y=hourly['Kumulativne_Vzniknute'],
+        name='🟢 Vzniknuté celkom (Zásoba)',
+        mode='lines',
+        line=dict(color='#2ca02c', width=2)
     ))
 
-    # Fialová čiara - Simulovaný priebeh
+    # Reálne vypickované vyrovnanou kapacitou
     fig_cum.add_trace(go.Scatter(
         x=hourly['Hodina_Label'], 
-        y=hourly['Simulovane_Vypickovane'],
-        name=f'🟣 SIMULÁCIA ({simulated_workers} ľudí x {pick_rate_default} lines/h)',
+        y=hourly['Kumulativne_Vypickovane'],
+        name=f'🟣 Kumulatívne Vypickované ({simulated_workers} ľudí)',
         mode='lines+markers',
         line=dict(color='#9467bd', width=4)
     ))
 
-    # Zelená čiara - Max dostupné na pickovanie (VYSVIETENÁ NA VRCHU)
+    # Min Limit
     fig_cum.add_trace(go.Scatter(
         x=hourly['Hodina_Label'], 
-        y=hourly['Kumulativne_Vzniknute'],
-        name='🟢 MAXIMUM: Vzniknuté (Dostupné na pick)',
+        y=hourly['Kumulativny_Limit'],
+        name='🔴 MINIMUM: Limit nanesenia',
         mode='lines+markers',
-        line=dict(color='#2ca02c', width=4),
-        marker=dict(size=8)
+        line=dict(color='#d62728', width=3, dash='dash')
     ))
 
     fig_cum.update_layout(
-        title="Priebeh kumulatívnej zásoby počas dňa",
+        title="Vyrovnaný priebeh pickovania: Krivka Vypickované musí byť VŽDY NAD červenou čiarou",
         xaxis_title="Prevádzková hodina (06:00 -> 05:00)",
         yaxis_title="Kumulatívny počet Joblines",
         xaxis=dict(type='category'),
@@ -197,18 +220,19 @@ if uploaded_file is not None:
 
     st.plotly_chart(fig_cum, use_container_width=True)
 
+    # Upozornenie
     if has_delay:
         delayed_hours = hourly[hourly['Meskanie']]['Hodina_Label'].tolist()
-        st.error(f"🚨 Pri počte {simulated_workers} ľudí vznikne meškanie v týchto hodinách: {', '.join(delayed_hours)}.")
+        st.error(f"🚨 Pri počte {simulated_workers} ľudí vznikne meškanie voči limitom v týchto hodinách: {', '.join(delayed_hours)}. Pridajte ľudí!")
     else:
-        st.success(f"🎉 Skvelé! S {simulated_workers} ľuďmi stíhate všetky limity nanesenia.")
+        st.success(f"🎉 Skvelé! S kapacitou {simulated_workers} ľudí stíhate všetky limity nanesenia a práca je vyrovnaná.")
 
     # --- DETAILNÁ TABUĽKA ---
-    with st.expander("📄 Zobraziť detailnú hodinovú tabuľku dát"):
+    with st.expander("📄 Zobraziť hodinovú bilanciu (Prítok, Výkon, Zostatok, Deadlines)"):
         st.dataframe(
-            hourly[['Hodina_Label', 'Vzniknute_v_hodine', 'Kumulativne_Vzniknute', 'Limit_v_hodine', 'Kumulativny_Limit', 'Simulovane_Vypickovane', 'Meskanie']],
+            hourly[['Hodina_Label', 'Vzniknute_v_hodine', 'Vypickovane_v_hodine', 'Zostatok_Prace_WIP', 'Limit_v_hodine', 'Kumulativny_Limit', 'Kumulativne_Vypickovane']],
             use_container_width=True
         )
 
 else:
-    st.info("👋 Nahraj súbor pre spustenie simulácie.")
+    st.info("👋 Nahraj súbor pre zobrazenie bilancie práce.")
