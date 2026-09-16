@@ -68,7 +68,7 @@ if uploaded_file is not None:
     selected_geo = st.sidebar.multiselect("Geo Size produktu", options=geo_sizes, default=geo_sizes)
     
     routings = df['RoutingType'].dropna().unique().tolist() if 'RoutingType' in df.columns else []
-    selected_routing = st.sidebar.multiselect("Routing Type", options=routings, defaultroutings)
+    selected_routing = st.sidebar.multiselect("Routing Type", options=routings, default=routings)
     
     filtered_df = df.copy()
     if geo_sizes:
